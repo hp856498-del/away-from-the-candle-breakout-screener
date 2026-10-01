@@ -3,6 +3,7 @@ import ccxt
 import pandas as pd
 from datetime import datetime, time
 import pytz
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Page configuration
 st.set_page_config(page_title="EMA Breakout Crypto Screener", layout="wide")
@@ -79,8 +80,8 @@ def calculate_closest_ema_distance(high, low, ema_val):
         sign = "+" if pct >= 0 else ""
         return f"Low({sign}{pct:.2f}%)"
 
-def check_away_and_breakout(df_scan, df_1h, df_4h, ema_period, breakout_type, date_filter_enabled, start_datetime, end_datetime):
-    """Scan dataframe for EMA away + volume breakout and calculate HTF EMA distances."""
+def check_away_and_breakout(df_scan, df_1h, df_4h, ema_period, breakout_type, vol_condition, date_filter_enabled, start_datetime, end_datetime):
+    """Scan dataframe for EMA away + volume breakout (both directions) and calculate HTF EMA distances."""
     if df_scan is None or len(df_scan) < ema_period + 5:
         return []
 
@@ -109,7 +110,7 @@ def check_away_and_breakout(df_scan, df_1h, df_4h, ema_period, breakout_type, da
         if not (is_away_above or is_away_below):
             continue
 
-        # Check the next up to 3 candles for breakout with volume
+        # Check the next up to 3 candles for breakout
         for offset in range(1, 4):
             breakout_idx = i + offset
             if breakout_idx >= len(df_scan):
@@ -118,24 +119,25 @@ def check_away_and_breakout(df_scan, df_1h, df_4h, ema_period, breakout_type, da
             b_row = df_scan.iloc[breakout_idx]
             b_high, b_low, b_close, b_vol = b_row['high'], b_row['low'], b_row['close'], b_row['volume']
 
-            # Volume condition: Breakout candle volume must be higher than Away candle volume
-            if b_vol <= vol:
+            # Volume Filter Condition Check
+            if vol_condition == "Higher Volume (Breakout Vol > Away Vol)" and b_vol <= vol:
+                continue
+            elif vol_condition == "Lower Volume (Breakout Vol < Away Vol)" and b_vol >= vol:
                 continue
 
             breakout_detected = False
             direction = ""
 
-            if is_away_above:
-                # Bullish away -> Breakout above high
-                if breakout_type == "High/Low Breakout" and b_high > high:
-                    breakout_detected = True
-                    direction = "Bullish High Break"
-                elif breakout_type == "Close Breakout" and b_close > high:
-                    breakout_detected = True
-                    direction = "Bullish Close Break"
+            # 1. Check for Bullish Breakout (Breakout candle crosses Away Candle High)
+            if breakout_type == "High/Low Breakout" and b_high > high:
+                breakout_detected = True
+                direction = "Bullish High Break"
+            elif breakout_type == "Close Breakout" and b_close > high:
+                breakout_detected = True
+                direction = "Bullish Close Break"
 
-            elif is_away_below:
-                # Bearish away -> Breakout below low
+            # 2. Check for Bearish Breakout (Breakout candle crosses Away Candle Low)
+            if not breakout_detected:
                 if breakout_type == "High/Low Breakout" and b_low < low:
                     breakout_detected = True
                     direction = "Bearish Low Break"
@@ -179,6 +181,26 @@ def check_away_and_breakout(df_scan, df_1h, df_4h, ema_period, breakout_type, da
 
     return matches
 
+def process_single_symbol(symbol, tf_option, ema_option, breakout_option, vol_option, enable_date, start_datetime, end_datetime):
+    """Helper function to process a single symbol for multithreading."""
+    df_scan = fetch_ohlcv_data(symbol, tf_option)
+    if df_scan is None:
+        return []
+        
+    df_1h = fetch_ohlcv_data(symbol, "1h") if tf_option != "1h" else df_scan
+    df_4h = fetch_ohlcv_data(symbol, "4h") if tf_option != "4h" else df_scan
+
+    matches = check_away_and_breakout(
+        df_scan, df_1h, df_4h, ema_option, breakout_option, vol_option, enable_date, start_datetime, end_datetime
+    )
+
+    symbol_results = []
+    for match in matches:
+        match['Symbol'] = f"{match['trend_symbol']} {symbol} {match['position_tag']}"
+        symbol_results.append(match)
+        
+    return symbol_results
+
 # Sidebar UI Options
 st.sidebar.header("⚙️ Screener Controls")
 
@@ -189,7 +211,7 @@ ema_option = st.sidebar.selectbox("Select EMA Period:", [2, 3, 4, 5, 6], index=1
 top_coins_count = st.sidebar.selectbox("Select Top Coins Count (by Volume):", [50, 100, 200, 400, 500, 600, 700], index=1)
 
 # 3. Timeframe Selection
-tf_option = st.sidebar.selectbox("Select Timeframe:", ["15m", "30m", "1h", "2h", "4h", "1d"], index=2)
+tf_option = st.sidebar.selectbox("Select Timeframe:", ["15m", "30m", "1h", "2h", "4h", "1d"], index=0)
 
 # 4. Breakout Type
 breakout_option = st.sidebar.selectbox(
@@ -198,7 +220,16 @@ breakout_option = st.sidebar.selectbox(
     help="Close Breakout requires candle to close beyond away candle high/low. High/Low Breakout checks if wick/touch breaks high/low."
 )
 
-# 5. Date & Time Filter (IST)
+# 5. Volume Condition Selection
+vol_option = st.sidebar.selectbox(
+    "Select Volume Filter:",
+    [
+        "Higher Volume (Breakout Vol > Away Vol)",
+        "Lower Volume (Breakout Vol < Away Vol)"
+    ]
+)
+
+# 6. Date & Time Filter (IST)
 st.sidebar.subheader("📅 Date & Time Filter (IST)")
 enable_date = st.sidebar.checkbox("Enable Specific Date & Time Filter")
 
@@ -226,24 +257,29 @@ if st.button("🚀 Start Scanning"):
     progress_bar = st.progress(0)
     status_text = st.empty()
 
-    for idx, symbol in enumerate(symbols):
-        status_text.text(f"Scanning ({idx + 1}/{len(symbols)}): {symbol}")
-        
-        # Fetch Scan Timeframe, 1h, and 4h data for distances/trends
-        df_scan = fetch_ohlcv_data(symbol, tf_option)
-        df_1h = fetch_ohlcv_data(symbol, "1h") if tf_option != "1h" else df_scan
-        df_4h = fetch_ohlcv_data(symbol, "4h") if tf_option != "4h" else df_scan
+    total_symbols = len(symbols)
+    completed = 0
 
-        matches = check_away_and_breakout(
-            df_scan, df_1h, df_4h, ema_option, breakout_option, enable_date, start_datetime, end_datetime
-        )
+    # ThreadPoolWorker set to 5 for stable Binance API limits
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_symbol = {
+            executor.submit(
+                process_single_symbol, symbol, tf_option, ema_option, breakout_option, vol_option, enable_date, start_datetime, end_datetime
+            ): symbol for symbol in symbols
+        }
 
-        for match in matches:
-            # Add Green/Red circle prefix and (U)/(D) suffix
-            match['Symbol'] = f"{match['trend_symbol']} {symbol} {match['position_tag']}"
-            results.append(match)
+        for future in as_completed(future_to_symbol):
+            symbol = future_to_symbol[future]
+            completed += 1
+            status_text.text(f"Scanning ({completed}/{total_symbols}): {symbol}")
+            progress_bar.progress(completed / total_symbols)
 
-        progress_bar.progress((idx + 1) / len(symbols))
+            try:
+                res = future.result()
+                if res:
+                    results.extend(res)
+            except Exception:
+                pass
 
     status_text.text("Scanning Completed!")
     progress_bar.empty()
